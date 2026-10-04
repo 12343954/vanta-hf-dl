@@ -33,12 +33,6 @@ jobs:
             artifact_path: |
               src-tauri/target/release/bundle/dmg/*.dmg
               src-tauri/target/release/bundle/macos/*.app
-          - name: macos-x64
-            os: macos-13
-            artifact_name: vanta-macos-x64
-            artifact_path: |
-              src-tauri/target/release/bundle/dmg/*.dmg
-              src-tauri/target/release/bundle/macos/*.app
 
     steps:
       - name: Checkout
