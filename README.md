@@ -1,3 +1,9 @@
+
+
+https://github.com/user-attachments/assets/4e7d2c4b-44d0-4751-92bf-cceb41123810
+
+
+
 # Vanta HF Downloader
 
 Vanta is a desktop downloader for Hugging Face model repositories. Its main goal is to keep ComfyUI model folders clean: downloaded files can be placed under an extra named subfolder, so different repositories do not get mixed together in the same model directory.
