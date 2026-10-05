@@ -102,6 +102,11 @@ This is only a release-page shortcut, not an automatic installer updater.
 - Private or gated Hugging Face repositories require a valid access token.
 - Existing downloads keep their current URL until paused and resumed.
 - Completed files are considered usable when the file size matches. If SHA256 is available and mismatches, Vanta shows a warning instead of failing the task.
+- macOS builds are unsigned. If macOS says the app is damaged, remove the quarantine flag and open it again:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Vanta.app
+```
 
 ## License
 
