@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use futures_util::StreamExt;
-use reqwest::header::{AUTHORIZATION, RANGE};
+use hf_hub::HFClient;
+use reqwest::header::{AUTHORIZATION, CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::process::Command;
@@ -151,7 +152,7 @@ fn backend_status() -> BackendStatus {
     BackendStatus {
         ready: true,
         storage: "sqlite",
-        downloader: "rust-range-32mb",
+        downloader: "hf-xet-auto + rust-range-32mb fallback",
     }
 }
 
@@ -331,6 +332,16 @@ async fn cancel_download_job(job_id: String) -> Result<Vec<DownloadJob>, String>
 #[tauri::command]
 async fn remove_download_job(job_id: String) -> Result<Vec<DownloadJob>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let job =
+            read_download_job(&job_id)?.ok_or_else(|| "download job not found".to_string())?;
+        if matches!(job.status.as_str(), "queued" | "downloading" | "verifying") {
+            return Err("pause or cancel an active download before deleting it".to_string());
+        }
+
+        // A model-library delete is a real local-file delete, not merely a
+        // queue-record delete.  Only the exact job paths are touched; parent
+        // model directories are deliberately retained for other files.
+        remove_download_artifacts(&job.target_path)?;
         let connection = open_database()?;
         connection
             .execute("delete from download_parts where job_id = ?1", [&job_id])
@@ -342,6 +353,34 @@ async fn remove_download_job(job_id: String) -> Result<Vec<DownloadJob>, String>
     })
     .await
     .map_err(|error| format!("remove task failed: {error}"))?
+}
+
+fn remove_download_artifacts(target_path: &str) -> Result<(), String> {
+    let target = PathBuf::from(target_path);
+    for path in [
+        target.clone(),
+        parts_dir(target_path),
+        xet_temp_path(target_path),
+        target.with_extension(format!(
+            "{}.part",
+            target
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("download")
+        )),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        if path.is_dir() {
+            fs::remove_dir_all(&path)
+                .map_err(|error| format!("failed to delete {}: {error}", path.display()))?;
+        } else {
+            fs::remove_file(&path)
+                .map_err(|error| format!("failed to delete {}: {error}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -408,6 +447,27 @@ async fn run_download_job(
         return Ok(());
     }
 
+    // Prefer Hugging Face's content-addressed Xet transport when the resolve
+    // endpoint advertises it.  The existing 32 MiB HTTP Range implementation
+    // remains the compatibility fallback for LFS/non-Xet/mirror failures.
+    match try_download_via_xet(&app, &job, &access_token, &proxy).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(error) => {
+            if matches!(read_job_status(&job_id)?.as_str(), "paused" | "canceled") {
+                return Ok(());
+            }
+            // Do not fail a queued download merely because a mirror does not
+            // fully implement Xet.  Fall back to the established Range path.
+            set_job_status(
+                &job_id,
+                "downloading",
+                Some(&format!("Xet unavailable, using Range fallback: {error}")),
+            )?;
+            emit_job_progress(&app, &job_id, "downloading", None);
+        }
+    }
+
     prepare_part_files(&job)?;
     let client = build_client(&proxy)?;
     let parts = read_incomplete_parts(&job_id)?;
@@ -436,11 +496,134 @@ async fn run_download_job(
         return Ok(());
     }
 
+    // All byte ranges are present, but the target is not usable yet.  Expose
+    // this separately so a 100% progress bar never looks like a hung download.
+    set_job_status(&job_id, "verifying", None)?;
+    emit_job_progress(&app, &job_id, "verifying", None);
     merge_parts(&job).await?;
-    let warning = checksum_warning(&job).await?;
-    set_job_completed(&job_id, job.size, warning.as_deref())?;
+    if matches!(read_job_status(&job_id)?.as_str(), "canceled" | "paused") {
+        return Ok(());
+    }
+    if let Some(warning) = checksum_warning(&job).await? {
+        let error = format!("checksum verification failed: {warning}");
+        set_job_status(&job_id, "failed", Some(&error))?;
+        emit_job_progress(&app, &job_id, "failed", Some(error));
+        return Ok(());
+    }
+    set_job_completed(&job_id, job.size, None)?;
     emit_job_progress(&app, &job_id, "completed", None);
     Ok(())
+}
+
+/// Uses the official Rust hf-hub client, which dispatches Xet-backed files to
+/// hf-xet.  hf-xet verifies the content-addressed chunks while reconstructing
+/// the stream; a failed chunk never reaches the final file.
+///
+/// Returns `Ok(false)` when this file is not Xet-backed.  Any Xet transport
+/// failure is returned to the caller, which deliberately falls back to the
+/// legacy 32 MiB Range downloader.
+async fn try_download_via_xet(
+    app: &AppHandle,
+    job: &DownloadJob,
+    access_token: &str,
+    proxy: &str,
+) -> Result<bool, String> {
+    let probe_client = build_client(proxy)?;
+    let mut probe = probe_client.head(&job.source_url);
+    if !access_token.trim().is_empty() {
+        probe = probe.header(AUTHORIZATION, format!("Bearer {}", access_token.trim()));
+    }
+    let probe = probe
+        .send()
+        .await
+        .map_err(|error| format!("Xet probe failed: {error}"))?;
+    if !probe.status().is_success() || !probe.headers().contains_key("x-xet-hash") {
+        return Ok(false);
+    }
+
+    let (owner, name) = job
+        .repo_id
+        .split_once('/')
+        .ok_or_else(|| format!("invalid Hugging Face repo id: {}", job.repo_id))?;
+    // Mirrors commonly redirect resolve URLs to the canonical Hub.  Xet token
+    // exchange itself must use the canonical Hub API.
+    let mut builder = HFClient::builder()
+        .endpoint("https://huggingface.co")
+        .cache_enabled(false)
+        .user_agent("Vanta/1.0");
+    if !access_token.trim().is_empty() {
+        builder = builder.token(access_token.trim());
+    }
+    let hub = builder
+        .build()
+        .map_err(|error| format!("failed to initialize Hugging Face Xet: {error}"))?;
+    let (_length, mut stream) = hub
+        .model(owner, name)
+        .download_file_stream()
+        .filename(job.file_path.clone())
+        .send()
+        .await
+        .map_err(|error| format!("Xet download could not start: {error}"))?;
+
+    let temp_path = xet_temp_path(&job.target_path);
+    if let Some(parent) = temp_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("failed to create Xet target directory: {error}"))?;
+    }
+    let mut file = tokio::fs::File::create(&temp_path)
+        .await
+        .map_err(|error| format!("failed to create Xet temporary file: {error}"))?;
+    let mut downloaded = 0_i64;
+    let mut last_progress_flush = Instant::now();
+    while let Some(chunk) = stream.next().await {
+        let status = read_job_status(&job.id)?;
+        if matches!(status.as_str(), "paused" | "canceled") {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(status);
+        }
+        let chunk =
+            chunk.map_err(|error| format!("Xet chunk verification/download failed: {error}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("failed to write Xet output: {error}"))?;
+        downloaded += chunk.len() as i64;
+        if last_progress_flush.elapsed() >= Duration::from_millis(500) {
+            set_job_downloaded(&job.id, downloaded, "downloading", None)?;
+            emit_job_progress_with_total(app, &job.id, downloaded, "downloading", None);
+            last_progress_flush = Instant::now();
+        }
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("failed to flush Xet output: {error}"))?;
+    drop(file);
+    if downloaded != job.size {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(format!(
+            "Xet size mismatch: expected {}, got {downloaded}",
+            job.size
+        ));
+    }
+    tokio::fs::rename(&temp_path, &job.target_path)
+        .await
+        .map_err(|error| format!("failed to finalize Xet output: {error}"))?;
+    if let Some(warning) = checksum_warning(job).await? {
+        let _ = tokio::fs::remove_file(&job.target_path).await;
+        return Err(format!("Xet final SHA256 check failed: {warning}"));
+    }
+    set_job_completed(&job.id, job.size, None)?;
+    emit_job_progress_with_total(app, &job.id, job.size, "completed", None);
+    Ok(true)
+}
+
+fn xet_temp_path(target_path: &str) -> PathBuf {
+    let target = PathBuf::from(target_path);
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("download");
+    target.with_file_name(format!(".{file_name}.xet-download"))
 }
 
 async fn download_part_with_retries(
@@ -565,6 +748,15 @@ async fn download_part(
             response.status()
         ));
     }
+    validate_content_range(
+        response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok()),
+        range_start,
+        part.end_byte,
+        part.part_index,
+    )?;
 
     if let Some(parent) = part_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -612,9 +804,44 @@ async fn download_part(
         }
     }
 
+    if downloaded != part_len {
+        return Err(format!(
+            "part {} length mismatch: expected {part_len}, got {downloaded}",
+            part.part_index
+        ));
+    }
+
     set_part_completed(&job.id, part.part_index, downloaded)?;
     let total = update_job_downloaded(&job.id)?;
     emit_job_progress_with_total(&app, &job.id, total, "downloading", None);
+    Ok(())
+}
+
+fn validate_content_range(
+    header: Option<&str>,
+    expected_start: i64,
+    expected_end: i64,
+    part_index: i64,
+) -> Result<(), String> {
+    let value = header.ok_or_else(|| format!("part {part_index} response has no Content-Range"))?;
+    let range = value
+        .strip_prefix("bytes ")
+        .and_then(|value| value.split_once('/').map(|(range, _)| range))
+        .and_then(|range| range.split_once('-'))
+        .ok_or_else(|| format!("part {part_index} has invalid Content-Range: {value}"))?;
+    let start = range
+        .0
+        .parse::<i64>()
+        .map_err(|_| format!("part {part_index} has invalid Content-Range start: {value}"))?;
+    let end = range
+        .1
+        .parse::<i64>()
+        .map_err(|_| format!("part {part_index} has invalid Content-Range end: {value}"))?;
+    if start != expected_start || end != expected_end {
+        return Err(format!(
+            "part {part_index} Content-Range mismatch: expected {expected_start}-{expected_end}, got {start}-{end}"
+        ));
+    }
     Ok(())
 }
 
@@ -1013,6 +1240,22 @@ fn set_job_completed(job_id: &str, size: i64, warning: Option<&str>) -> Result<(
             (job_id, size, warning),
         )
         .map_err(|error| format!("failed to complete job: {error}"))?;
+    Ok(())
+}
+
+fn set_job_downloaded(
+    job_id: &str,
+    downloaded_bytes: i64,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let connection = open_database()?;
+    connection
+        .execute(
+            "update download_jobs set downloaded_bytes = ?2, status = ?3, error = ?4, updated_at = current_timestamp where id = ?1",
+            (job_id, downloaded_bytes, status, error),
+        )
+        .map_err(|error| format!("failed to update Xet job progress: {error}"))?;
     Ok(())
 }
 

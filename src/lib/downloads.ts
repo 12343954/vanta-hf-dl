@@ -3,7 +3,7 @@ import type { FileTreeRow } from './huggingface'
 
 export const downloadQueueStorageKey = 'vanta:download-queue'
 
-export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'completed' | 'failed' | 'error' | 'canceled'
+export type DownloadStatus = 'queued' | 'downloading' | 'verifying' | 'paused' | 'completed' | 'failed' | 'error' | 'canceled'
 
 export type DownloadJob = {
   id: string

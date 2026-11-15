@@ -294,7 +294,9 @@ export async function getModelReadme(repoId: string, signal?: AbortSignal, token
 
 export async function getModelTree(repoId: string, signal?: AbortSignal, token?: string, endpoint?: string) {
   const entries = await getJson<HfTreeEntry[]>(
-    `${normalizeEndpoint(endpoint)}/api/models/${repoId}/tree/main?recursive=1`,
+    // `lfs.oid` is returned only when blobs are requested.  Without it the
+    // downloader silently loses the server-provided SHA256 for large files.
+    `${normalizeEndpoint(endpoint)}/api/models/${repoId}/tree/main?recursive=1&blobs=true`,
     signal,
     token,
   )

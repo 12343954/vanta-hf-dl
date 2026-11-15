@@ -193,11 +193,12 @@ function resolveReadmeAsset(repoId: string, value?: string, endpoint = 'https://
 const downloadStatusRank: Record<DownloadJob['status'], number> = {
   queued: 0,
   downloading: 1,
-  paused: 2,
-  error: 2,
-  failed: 2,
-  canceled: 3,
-  completed: 4,
+  verifying: 2,
+  paused: 3,
+  error: 3,
+  failed: 3,
+  canceled: 4,
+  completed: 5,
 }
 
 function mergeDownloadJobs(current: DownloadJob[], incoming: DownloadJob[]) {
@@ -240,6 +241,9 @@ function getDirectoryName(path: string) {
 function getGroupStatus(jobs: DownloadJob[]): DownloadJob['status'] {
   if (jobs.some((job) => job.status === 'downloading')) {
     return 'downloading'
+  }
+  if (jobs.some((job) => job.status === 'verifying')) {
+    return 'verifying'
   }
   if (jobs.some((job) => job.status === 'queued')) {
     return 'queued'
@@ -459,6 +463,8 @@ function App() {
   const resultsRef = useRef<HTMLDivElement>(null)
   const speedSamplesRef = useRef<Record<string, { bytes: number, time: number }>>({})
   const totalSpeedSampleRef = useRef<{ bytes: number, time: number } | undefined>(undefined)
+  const totalDownloadBytesRef = useRef(0)
+  const hasActiveDownloadRef = useRef(false)
   const autoRetryCooldownRef = useRef<Record<string, number>>({})
   const activeDownloadCountRef = useRef(0)
   const closePreferenceRef = useRef<ClosePreference | ''>(loadClosePreference())
@@ -525,14 +531,15 @@ function App() {
   const selectedFiles = treeRows.filter((row) => row.type === 'file' && checkedRows.has(row.id))
   const selectedBytes = selectedFiles.reduce((total, row) => total + row.size, 0)
   const selectedSize = selectedBytes > 0 ? formatBytes(selectedBytes) : '0 B'
-  const activeJobs = downloadJobs.filter((job) => job.status === 'downloading' || job.status === 'queued')
+  const activeJobs = downloadJobs.filter((job) => job.status === 'downloading' || job.status === 'queued' || job.status === 'verifying')
   const completedJobs = downloadJobs.filter((job) => job.status === 'completed')
   const hasDownloadingJobs = downloadJobs.some((job) => job.status === 'downloading')
   const hasQueuedJobs = downloadJobs.some((job) => job.status === 'queued')
   const hasResumableJobs = downloadJobs.some((job) => job.status === 'paused' || job.status === 'failed' || job.status === 'error')
   const globalControlMode = hasDownloadingJobs ? 'pause' : hasResumableJobs ? 'start' : hasQueuedJobs ? 'stop' : null
-  const sampledSpeed = Object.values(downloadSpeeds).reduce((total, speed) => total + speed, 0)
-  const overallSpeed = Math.max(totalDownloadSpeed, sampledSpeed)
+  // The upper-right aggregate is deliberately sampled once per second. Per-job
+  // speeds below can update with progress events without making this number jump.
+  const overallSpeed = totalDownloadSpeed
 
   const checkForUpdates = useCallback(async () => {
     try {
@@ -607,7 +614,7 @@ function App() {
         const downloadedBytes = jobs.reduce((total, job) => total + job.downloadedBytes, 0)
         const sortedJobs = [...jobs].sort(compareDownloadJobs)
         return {
-          activeCount: jobs.filter((job) => job.status === 'downloading' || job.status === 'queued').length,
+          activeCount: jobs.filter((job) => job.status === 'downloading' || job.status === 'queued' || job.status === 'verifying').length,
           completedCount: jobs.filter((job) => job.status === 'completed').length,
           downloadedBytes,
           failedCount: jobs.filter((job) => job.status === 'failed' || job.status === 'error').length,
@@ -792,7 +799,7 @@ function App() {
   }, [activeView, settings])
 
   useEffect(() => {
-    activeDownloadCountRef.current = downloadJobs.filter((job) => job.status === 'downloading' || job.status === 'queued').length
+    activeDownloadCountRef.current = downloadJobs.filter((job) => job.status === 'downloading' || job.status === 'queued' || job.status === 'verifying').length
   }, [downloadJobs])
 
   useEffect(() => {
@@ -881,7 +888,10 @@ function App() {
           return {
             ...job,
             downloadedBytes,
-            status: downloadedBytes >= job.size ? 'completed' as const : job.status,
+            // Reaching the expected byte count only means that all range
+            // responses arrived.  The backend still has to merge and verify
+            // the file; only its explicit `completed` event is authoritative.
+            status: job.status,
             updatedAt: now,
           }
         })
@@ -985,34 +995,25 @@ function App() {
   }, [activeView])
 
   useEffect(() => {
-    const now = Date.now()
-    const downloadedBytes = downloadJobs.reduce((total, job) => total + job.downloadedBytes, 0)
-    const hasActiveDownload = downloadJobs.some((job) => job.status === 'downloading')
-    const previous = totalSpeedSampleRef.current
-    totalSpeedSampleRef.current = { bytes: downloadedBytes, time: now }
-
-    if (!previous || !hasActiveDownload) {
-      if (!hasActiveDownload) {
-        setTotalDownloadSpeed(0)
-      }
-      return
-    }
-
-    const elapsedSeconds = (now - previous.time) / 1000
-    const deltaBytes = Math.max(0, downloadedBytes - previous.bytes)
-    if (elapsedSeconds > 0.2 && deltaBytes > 0) {
-      setTotalDownloadSpeed(Math.round(deltaBytes / elapsedSeconds))
-    }
+    totalDownloadBytesRef.current = downloadJobs.reduce((total, job) => total + job.downloadedBytes, 0)
+    hasActiveDownloadRef.current = downloadJobs.some((job) => job.status === 'downloading')
   }, [downloadJobs])
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
+    const sample = () => {
+      const now = Date.now()
+      const bytes = totalDownloadBytesRef.current
+      const active = hasActiveDownloadRef.current
       const previous = totalSpeedSampleRef.current
-      if (!previous || Date.now() - previous.time > 8000) {
+      totalSpeedSampleRef.current = { bytes, time: now }
+      if (!previous || !active) {
         setTotalDownloadSpeed(0)
+        return
       }
-    }, 1200)
-
+      setTotalDownloadSpeed(Math.round(Math.max(0, bytes - previous.bytes) / ((now - previous.time) / 1000)))
+    }
+    sample()
+    const timer = window.setInterval(sample, 1000)
     return () => window.clearInterval(timer)
   }, [])
 
@@ -1212,6 +1213,13 @@ function App() {
     })
     const nextGroups = new Set(nextJobs.map((job) => getDirectoryPath(job.targetPath)))
     setOpenDownloadGroups((current) => new Set([...current, ...nextGroups]))
+    // Show the request immediately.  Creating thousands of 32 MiB part rows
+    // can take a noticeable moment for very large GGUF files, but the UI
+    // should never look as though the click was ignored.
+    setDownloadJobs((current) => {
+      const currentIds = new Set(current.map((job) => job.id))
+      return [...nextJobs.filter((job) => !currentIds.has(job.id)), ...current]
+    })
     setToastMessage(`${t('queuedFiles')} · ${nextJobs.length}`)
     window.setTimeout(() => setToastMessage(''), 2200)
     if (hasTauriRuntime()) {
@@ -1225,12 +1233,13 @@ function App() {
           setDownloadJobs((current) => mergeDownloadJobs(current, jobs))
         }
       }).catch((downloadError) => {
+        const failedIds = new Set(nextJobs.map((job) => job.id))
+        setDownloadJobs((current) => current.map((job) => (
+          failedIds.has(job.id)
+            ? { ...job, error: downloadError instanceof Error ? downloadError.message : 'Download enqueue failed', status: 'failed' }
+            : job
+        )))
         setError(downloadError instanceof Error ? downloadError.message : 'Download enqueue failed')
-      })
-    } else {
-      setDownloadJobs((current) => {
-        const currentIds = new Set(current.map((job) => job.id))
-        return [...nextJobs.filter((job) => !currentIds.has(job.id)), ...current]
       })
     }
     setActiveView('history')
@@ -1279,6 +1288,14 @@ function App() {
     }
   }
 
+  const startDownloadGroup = (group: DownloadGroup) => {
+    for (const job of group.jobs) {
+      if (job.status === 'paused' || job.status === 'failed' || job.status === 'error') {
+        resumeJob(job.id)
+      }
+    }
+  }
+
   const pauseAllJobs = () => {
     for (const job of downloadJobs) {
       if (job.status === 'downloading' || job.status === 'queued') {
@@ -1291,14 +1308,6 @@ function App() {
     for (const job of downloadJobs) {
       if (job.status !== 'completed' && job.status !== 'canceled') {
         cancelJob(job.id)
-      }
-    }
-  }
-
-  const startDownloadGroup = (group: DownloadGroup) => {
-    for (const job of group.jobs) {
-      if (job.status === 'paused' || job.status === 'failed' || job.status === 'error') {
-        resumeJob(job.id)
       }
     }
   }
@@ -1337,7 +1346,11 @@ function App() {
       return
     }
     if (hasTauriRuntime()) {
-      void removeDesktopDownloadJob(id).then((jobs) => jobs && setDownloadJobs(jobs))
+      void removeDesktopDownloadJob(id)
+        .then((jobs) => jobs && setDownloadJobs(jobs))
+        .catch((removeError) => {
+          setError(removeError instanceof Error ? removeError.message : 'Model deletion failed')
+        })
     } else {
       setDownloadJobs((current) => current.filter((job) => job.id !== id))
     }
@@ -1957,7 +1970,7 @@ function App() {
                             <Pause size={15} />
                           </button>
                         ) : canStartGroup ? (
-                          <button className="icon-pill text" onClick={() => startDownloadGroup(group)} aria-label={`Start ${group.title}`}>
+                          <button className="icon-pill text" onClick={() => startDownloadGroup(group)} aria-label={`Start all files in ${group.title}`}>
                             <Play size={15} />
                           </button>
                         ) : null}
