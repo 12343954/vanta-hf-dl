@@ -38,7 +38,9 @@ jobs:
               src-tauri/target/release/bundle/rpm/*.rpm
               src-tauri/target/release/bundle/appimage/*.AppImage
           - name: macos-arm64
-            os: macos-14
+            # GitHub-hosted Apple Silicon runner. Avoid macos-14, whose
+            # region-specific runner is unavailable for this repository.
+            os: macos-latest
             artifact_name: vanta-macos-arm64
             artifact_path: |
               src-tauri/target/release/bundle/dmg/*.dmg
@@ -88,7 +90,7 @@ jobs:
       - name: Package Windows portable zip
         if: matrix.name == 'windows-x64'
         shell: pwsh
-        run: Compress-Archive -Path src-tauri/target/release/vanta.exe -DestinationPath src-tauri/target/release/bundle/Vanta_1.0.0_windows-x64-portable.zip -Force
+        run: Compress-Archive -Path src-tauri/target/release/vanta.exe -DestinationPath src-tauri/target/release/bundle/Vanta_${{ github.ref_name }}_windows-x64-portable.zip -Force
 
       - name: Package macOS app zip
         if: matrix.name == 'macos-arm64'
