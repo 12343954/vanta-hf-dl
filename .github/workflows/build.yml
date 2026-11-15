@@ -96,7 +96,7 @@ jobs:
         if: matrix.name == 'macos-arm64'
         run: |
           cd src-tauri/target/release/bundle/macos
-          ditto -c -k --sequesterRsrc --keepParent Vanta.app ../../Vanta_1.0.0_macos-arm64-app.zip
+          ditto -c -k --sequesterRsrc --keepParent Vanta.app ../Vanta_${{ github.ref_name }}_macos-arm64-app.zip
 
       - name: Upload bundles
         uses: actions/upload-artifact@v4
